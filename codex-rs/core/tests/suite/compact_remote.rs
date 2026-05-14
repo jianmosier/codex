@@ -1717,6 +1717,103 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_manual_compact_retries_transient_compact_errors() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(1);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    mount_sse_once(
+        harness.server(),
+        sse(vec![
+            responses::ev_assistant_message("m1", "REMOTE_REPLY"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let compact_mock = responses::mount_compact_response_sequence(
+        harness.server(),
+        vec![
+            ResponseTemplate::new(502).set_body_string("bad gateway"),
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "output": compacted_summary_only_output("REMOTE_COMPACTED_AFTER_RETRY")
+                })),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "manual remote compact retry".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await?;
+
+    let mut saw_retry_notice = false;
+    let mut saw_completed_item = false;
+    let mut saw_error = false;
+    let mut saw_turn_complete = false;
+
+    while !saw_turn_complete || !saw_retry_notice || !saw_completed_item {
+        let event = tokio::time::timeout(REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT, codex.next_event())
+            .await
+            .expect("timed out waiting for compact retry events")
+            .unwrap();
+        match event.msg {
+            EventMsg::StreamError(err) => {
+                saw_retry_notice |= err.message.contains("Retrying compaction");
+            }
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::ContextCompaction(_),
+                ..
+            }) => {
+                saw_completed_item = true;
+            }
+            EventMsg::Error(_) => {
+                saw_error = true;
+            }
+            EventMsg::TurnComplete(_) => {
+                saw_turn_complete = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_retry_notice, "expected retry notice event");
+    assert!(saw_completed_item, "expected compact item completion");
+    assert!(
+        !saw_error,
+        "compact retry should recover without an error event"
+    );
+    assert_eq!(
+        compact_mock.requests().len(),
+        2,
+        "expected initial compact failure and one retry"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_manual_compact_failure_emits_task_error_event() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

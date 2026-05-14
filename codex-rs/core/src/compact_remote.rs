@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::Prompt;
 use crate::client::CompactConversationRequestSettings;
@@ -18,6 +19,7 @@ use crate::hook_runtime::run_pre_compact_hooks;
 use crate::session::session::Session;
 use crate::session::turn::built_tools;
 use crate::session::turn_context::TurnContext;
+use crate::util::backoff;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
@@ -33,10 +35,12 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
+use codex_rollout_trace::CompactionTraceContext;
 use futures::TryFutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -189,37 +193,9 @@ async fn run_remote_compact_task_inner_impl(
         output_schema: None,
         output_schema_strict: true,
     };
-    let mut new_history = sess
-        .services
-        .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort,
-                summary: turn_context.reasoning_summary,
-                service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
-                    None
-                } else {
-                    turn_context.config.service_tier.clone()
-                },
-            },
-            &turn_context.session_telemetry,
-            &compaction_trace,
-        )
-        .or_else(|err| async {
-            let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
-            let compact_request_log_data =
-                build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
-            log_remote_compact_failure(
-                turn_context,
-                &compact_request_log_data,
-                total_usage_breakdown,
-                &err,
-            );
-            Err(err)
-        })
-        .await?;
+    let mut new_history =
+        compact_conversation_history_with_retry(sess, turn_context, &prompt, &compaction_trace)
+            .await?;
     new_history = process_compacted_history(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -250,6 +226,110 @@ async fn run_remote_compact_task_inner_impl(
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
     Ok(())
+}
+
+async fn compact_conversation_history_with_retry(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    prompt: &Prompt,
+    compaction_trace: &CompactionTraceContext,
+) -> CodexResult<Vec<ResponseItem>> {
+    let max_retries = turn_context.provider.info().stream_max_retries();
+    let mut retries = 0u64;
+
+    loop {
+        let service_tier = if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
+            None
+        } else {
+            turn_context.config.service_tier.clone()
+        };
+        let result = sess
+            .services
+            .model_client
+            .compact_conversation_history(
+                prompt,
+                &turn_context.model_info,
+                CompactConversationRequestSettings {
+                    effort: turn_context.reasoning_effort,
+                    summary: turn_context.reasoning_summary,
+                    service_tier,
+                },
+                &turn_context.session_telemetry,
+                compaction_trace,
+            )
+            .or_else(|err| async {
+                let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
+                let compact_request_log_data =
+                    build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
+                log_remote_compact_failure(
+                    turn_context,
+                    &compact_request_log_data,
+                    total_usage_breakdown,
+                    &err,
+                );
+                Err(err)
+            })
+            .await;
+
+        match result {
+            Ok(new_history) => return Ok(new_history),
+            Err(err) if should_retry_remote_compact_error(&err) && retries < max_retries => {
+                retries += 1;
+                let delay = remote_compact_retry_delay(&err, retries);
+                warn!(
+                    "remote compact request failed; retrying ({retries}/{max_retries} in {delay:?})..."
+                );
+                sess.notify_stream_error(
+                    turn_context,
+                    format!("Retrying compaction... {retries}/{max_retries}"),
+                    err,
+                )
+                .await;
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn remote_compact_retry_delay(err: &CodexErr, retry_attempt: u64) -> Duration {
+    match err {
+        CodexErr::Stream(_, Some(delay)) => *delay,
+        _ => backoff(retry_attempt),
+    }
+}
+
+fn should_retry_remote_compact_error(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::Stream(message, _) => is_retryable_remote_compact_stream_error(message),
+        CodexErr::Timeout
+        | CodexErr::ConnectionFailed(_)
+        | CodexErr::ResponseStreamFailed(_)
+        | CodexErr::InternalServerError
+        | CodexErr::InternalAgentDied
+        | CodexErr::Io(_)
+        | CodexErr::TokioJoin(_) => true,
+        CodexErr::UnexpectedStatus(err) => err.status.is_server_error(),
+        _ => false,
+    }
+}
+
+fn is_retryable_remote_compact_stream_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "error sending request",
+        "stream disconnected",
+        "stream closed",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "incomplete message",
+        "body write aborted",
+        "operation timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 pub(crate) async fn process_compacted_history(
@@ -384,4 +464,29 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     }
 
     deleted_items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_remote_compact_error_matches_reported_disconnect() {
+        let err = CodexErr::Stream(
+            "error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact): stream disconnected before completion".to_string(),
+            None,
+        );
+
+        assert!(should_retry_remote_compact_error(&err));
+    }
+
+    #[test]
+    fn retryable_remote_compact_error_ignores_compact_payload_parse_errors() {
+        let err = CodexErr::Stream(
+            "invalid type: string \"invalid compact payload shape\", expected struct CompactHistoryResponse".to_string(),
+            None,
+        );
+
+        assert!(!should_retry_remote_compact_error(&err));
+    }
 }
